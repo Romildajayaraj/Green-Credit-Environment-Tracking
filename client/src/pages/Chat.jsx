@@ -1,0 +1,686 @@
+import { useState, useEffect, useRef } from 'react'
+import { useAuth } from '../context/AuthContext'
+import { motion } from 'framer-motion'
+import { FiSend, FiPaperclip, FiSmile, FiImage, FiVideo, FiMic, FiFile, FiX, FiCornerUpLeft, FiTrash2, FiDownload, FiUsers } from 'react-icons/fi'
+import axios from 'axios'
+import Swal from 'sweetalert2'
+import io from 'socket.io-client'
+
+const Chat = () => {
+  const { user } = useAuth()
+  const [messages, setMessages] = useState([])
+  const [newMessage, setNewMessage] = useState('')
+  const [selectedFiles, setSelectedFiles] = useState([])
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false)
+  const [replyTo, setReplyTo] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [onlineUsers, setOnlineUsers] = useState([])
+  const [typingUsers, setTypingUsers] = useState([])
+  const [socket, setSocket] = useState(null)
+  const [connected, setConnected] = useState(false)
+  const messagesEndRef = useRef(null)
+  const fileInputRef = useRef(null)
+  const textareaRef = useRef(null)
+  const typingTimeoutRef = useRef(null)
+
+  const emojis = ['😀', '😂', '😍', '🥰', '😊', '😎', '🤔', '😢', '😡', '👍', '👎', '❤️', '🔥', '💯', '🎉', '🌱', '🌍', '♻️', '🌳', '🌿']
+
+  // Initialize Socket.IO connection
+  useEffect(() => {
+    if (user) {
+      const token = localStorage.getItem('token')
+      const newSocket = io('http://localhost:5000', {
+        auth: { token }
+      })
+
+      newSocket.on('connect', () => {
+        console.log('Connected to server')
+        setConnected(true)
+        setSocket(newSocket)
+      })
+
+      newSocket.on('disconnect', () => {
+        console.log('Disconnected from server')
+        setConnected(false)
+      })
+
+      newSocket.on('connect_error', (error) => {
+        console.error('Connection error:', error)
+        setConnected(false)
+      })
+
+      // Listen for online users updates
+      newSocket.on('onlineUsers', (users) => {
+        setOnlineUsers(users)
+      })
+
+      // Listen for new messages
+      newSocket.on('messageReceived', (message) => {
+        setMessages(prev => [...prev, message])
+      })
+
+      // Listen for typing indicators
+      newSocket.on('userTyping', (data) => {
+        setTypingUsers(prev => {
+          const filtered = prev.filter(u => u.userId !== data.userId)
+          if (data.isTyping) {
+            return [...filtered, data]
+          }
+          return filtered
+        })
+      })
+
+      // Listen for reaction updates
+      newSocket.on('reactionUpdate', (data) => {
+        setMessages(prev => prev.map(msg => 
+          msg._id === data.messageId 
+            ? { ...msg, reactions: data.reactions }
+            : msg
+        ))
+      })
+
+      // Listen for message deletions
+      newSocket.on('messageDeleted', (data) => {
+        setMessages(prev => prev.map(msg => 
+          msg._id === data.messageId 
+            ? { ...msg, deleted: true, content: { text: 'This message was deleted', files: [] } }
+            : msg
+        ))
+      })
+
+      return () => {
+        newSocket.close()
+      }
+    }
+  }, [user])
+
+  // Fetch initial messages
+  useEffect(() => {
+    fetchMessages()
+  }, [])
+
+  useEffect(() => {
+    scrollToBottom()
+  }, [messages])
+
+  useEffect(() => {
+    adjustTextareaHeight()
+  }, [newMessage])
+
+  const fetchMessages = async () => {
+    try {    
+      const response = await axios.get('/api/chat/rooms/general')
+      setMessages(response.data.messages || [])
+    } catch (error) {
+      console.error('Error fetching messages:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }
+
+  const adjustTextareaHeight = () => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 120) + 'px'
+    }
+  }
+
+  const handleTyping = (isTyping) => {
+    if (socket && connected) {
+      socket.emit('typing', { isTyping })
+    }
+  }
+
+  const handleInputChange = (e) => {
+    setNewMessage(e.target.value)
+    
+    // Handle typing indicator
+    if (e.target.value.trim()) {
+      handleTyping(true)
+      
+      // Clear previous timeout
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current)
+      }
+      
+      // Set timeout to stop typing indicator
+      typingTimeoutRef.current = setTimeout(() => {
+        handleTyping(false)
+      }, 1000)
+    } else {
+      handleTyping(false)
+    }
+  }
+
+  const handleFileSelect = (e) => {
+    const files = Array.from(e.target.files)
+    if (files.length + selectedFiles.length > 10) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Too Many Files',
+        text: 'Maximum 10 files allowed per message'
+      })
+      return
+    }
+
+    const validFiles = files.filter(file => {
+      if (file.size > 100 * 1024 * 1024) {
+        Swal.fire({
+          icon: 'error',
+          title: 'File Too Large',
+          text: `${file.name} is larger than 100MB`
+        })
+        return false
+      }
+      return true
+    })
+
+    setSelectedFiles(prev => [...prev, ...validFiles])
+  }
+
+  const removeFile = (index) => {
+    setSelectedFiles(prev => prev.filter((_, i) => i !== index))
+  }
+
+  const sendMessage = async () => {
+    if (!newMessage.trim() && selectedFiles.length === 0) return
+
+    const formData = new FormData()
+    formData.append('text', newMessage.trim())
+    
+    if (replyTo) {
+      formData.append('replyTo', replyTo._id)
+    }
+
+    selectedFiles.forEach(file => {
+      formData.append('files', file)
+    })
+
+    try {
+      // Stop typing indicator
+      handleTyping(false)
+      
+      await axios.post('/api/chat/rooms/general/messages', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      })
+      
+      setNewMessage('')
+      setSelectedFiles([])
+      setReplyTo(null)
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Send Failed',
+        text: error.response?.data?.message || 'Failed to send message'
+      })
+    }
+  }
+
+  const addEmoji = (emoji) => {
+    setNewMessage(prev => prev + emoji)
+    setShowEmojiPicker(false)
+    textareaRef.current?.focus()
+  }
+
+  const reactToMessage = async (messageId, emoji) => {
+    try {
+      await axios.put(`/api/chat/rooms/general/messages/${messageId}/react`, { emoji })
+    } catch (error) {
+      console.error('Error reacting to message:', error)
+    }
+  }
+
+  const deleteMessage = async (messageId) => {
+    const result = await Swal.fire({
+      title: 'Delete Message?',
+      text: 'This action cannot be undone',
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonColor: '#d33',
+      cancelButtonColor: '#3085d6',
+      confirmButtonText: 'Delete'
+    })
+
+    if (result.isConfirmed) {
+      try {
+        await axios.delete(`/api/chat/rooms/general/messages/${messageId}`)
+        Swal.fire('Deleted!', 'Message has been deleted.', 'success')
+      } catch (error) {
+        Swal.fire('Error!', 'Failed to delete message.', 'error')
+      }
+    }
+  }
+
+  const getFileIcon = (fileType) => {
+    switch (fileType) {
+      case 'image': return <FiImage className="w-4 h-4 text-green-600" />
+      case 'video': return <FiVideo className="w-4 h-4 text-blue-600" />
+      case 'audio': return <FiMic className="w-4 h-4 text-purple-600" />
+      default: return <FiFile className="w-4 h-4 text-gray-600" />
+    }
+  }
+
+  const formatFileSize = (bytes) => {
+    if (bytes === 0) return '0 Bytes'
+    const k = 1024
+    const sizes = ['Bytes', 'KB', 'MB', 'GB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+  }
+
+  const formatTime = (dateString) => {
+    const date = new Date(dateString)
+    const now = new Date()
+    const diffInHours = (now - date) / (1000 * 60 * 60)
+
+    if (diffInHours < 24) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    } else {
+      return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-primary-500"></div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-primary-50 to-secondary-100">
+      <div className="max-w-7xl mx-auto px-4 py-8">
+        <motion.div
+          initial={{ opacity: 0, y: 30 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+          className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-[85vh]"
+        >
+          {/* Online Users Sidebar */}
+          <div className="lg:col-span-1 card p-4">
+            <div className="flex items-center space-x-2 mb-4">
+              <FiUsers className="w-5 h-5 text-primary-600" />
+              <h3 className="font-bold text-secondary-900">Online Users</h3>
+              <span className="bg-primary-100 text-primary-800 px-2 py-1 rounded-full text-xs">
+                {onlineUsers.length}
+              </span>
+              {/* Connection Status */}
+              <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} 
+                   title={connected ? 'Connected' : 'Disconnected'} />
+            </div>
+            <div className="space-y-2">
+              {onlineUsers.map((onlineUser) => (
+                <div key={onlineUser.id} className="flex items-center space-x-3 p-2 hover:bg-secondary-50 rounded-lg">
+                  <div className="relative">
+                    <div className="w-8 h-8 bg-gradient-to-r from-primary-400 to-primary-600 rounded-full flex items-center justify-center text-white text-sm font-bold overflow-hidden">
+                      {onlineUser.profileImage ? (
+                        <img
+                          src={`http://localhost:5000${onlineUser.profileImage}`}
+                          alt={onlineUser.name}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        onlineUser.name?.charAt(0) || 'U'
+                      )}
+                    </div>
+                    <div className="absolute -bottom-1 -right-1 w-3 h-3 bg-green-500 border-2 border-white rounded-full"></div>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-secondary-900 truncate">
+                      {onlineUser.name}
+                      {onlineUser.id === user?.id && ' (You)'}
+                    </p>
+                    <p className="text-xs text-secondary-500">Online</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Chat Area */}
+          <div className="lg:col-span-3 card flex flex-col">
+            <div className="border-b border-secondary-200 p-4">
+              <h1 className="text-2xl font-bold gradient-text flex items-center">
+                Green Community Chat
+                {connected && <span className="ml-2 text-xs bg-green-100 text-green-800 px-2 py-1 rounded-full">Live</span>}
+              </h1>
+              <p className="text-secondary-600">Connect with fellow environmental enthusiasts</p>
+            </div>
+
+            {/* Messages Area */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {messages.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="w-16 h-16 bg-gradient-to-r from-primary-400 to-primary-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <span className="text-2xl">💬</span>
+                  </div>
+                  <h3 className="text-lg font-medium text-secondary-900 mb-2">Start the conversation!</h3>
+                  <p className="text-secondary-600">Be the first to share your thoughts about environmental topics.</p>
+                </div>
+              ) : (
+                messages.map((message, index) => (
+                  <motion.div
+                    key={message._id}
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3, delay: index * 0.05 }}
+                    className={`flex ${message.sender._id === user?.id ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div className={`max-w-xs lg:max-w-md xl:max-w-lg ${message.sender._id === user?.id ? 'order-2' : 'order-1'}`}>
+                      {message.sender._id !== user?.id && (
+                        <div className="flex items-center space-x-2 mb-1">
+                          <div className="w-6 h-6 bg-gradient-to-r from-primary-400 to-primary-600 rounded-full flex items-center justify-center text-white text-xs font-bold overflow-hidden">
+                            {message.sender.profileImage ? (
+                              <img
+                                src={`http://localhost:5000${message.sender.profileImage}`}
+                                alt={message.sender.name}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              message.sender.name?.charAt(0) || 'U'
+                            )}
+                          </div>
+                          <span className="text-sm text-secondary-600 font-medium">{message.sender.name}</span>
+                          <span className="text-xs text-secondary-400">{formatTime(message.createdAt)}</span>
+                        </div>
+                      )}
+
+                      <div className={`rounded-2xl p-3 ${
+                        message.sender._id === user?.id 
+                          ? 'bg-gradient-to-r from-primary-500 to-primary-600 text-white' 
+                          : 'bg-white border border-secondary-200 text-secondary-900'
+                      } ${message.deleted ? 'opacity-50' : ''} shadow-sm`}>
+                        
+                        {message.replyTo && (
+                          <div className={`${
+                            message.sender._id === user?.id ? 'bg-black bg-opacity-20' : 'bg-secondary-100'
+                          } rounded-lg p-2 mb-2 text-xs border-l-2 ${
+                            message.sender._id === user?.id ? 'border-white' : 'border-primary-500'
+                          }`}>
+                            <FiCornerUpLeft className="w-3 h-3 inline mr-1" />
+                            <span className="opacity-75">
+                              Replying to {message.replyTo.sender?.name}: {message.replyTo.content?.text?.slice(0, 30)}...
+                            </span>
+                          </div>
+                        )}
+
+                        {message.content.text && (
+                          <p className="break-words whitespace-pre-wrap">{message.content.text}</p>
+                        )}
+
+                        {message.content.files && message.content.files.length > 0 && (
+                          <div className="mt-2 space-y-2">
+                            {message.content.files.map((file, fileIndex) => (
+                              <div key={fileIndex}>
+                                <div className={`flex items-center space-x-2 p-2 rounded-lg ${
+                                  message.sender._id === user?.id ? 'bg-black bg-opacity-20' : 'bg-secondary-50'
+                                }`}>
+                                  {getFileIcon(file.fileType)}
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-sm font-medium truncate">{file.originalName}</p>
+                                    <p className="text-xs opacity-75">{formatFileSize(file.fileSize)}</p>
+                                  </div>
+                                  <a
+                                    href={file.fileUrl.startsWith('http') ? file.fileUrl : `http://localhost:5000${file.fileUrl}`}
+                                    download={file.originalName}
+                                    className={`p-1 rounded hover:${
+                                      message.sender._id === user?.id ? 'bg-black bg-opacity-20' : 'bg-secondary-200'
+                                    } transition-colors`}
+                                  >
+                                    <FiDownload className="w-4 h-4" />
+                                  </a>
+                                </div>
+                                
+                                {file.fileType === 'image' && (
+                                  <div className="mt-2">
+                                    <img
+                                      src={file.fileUrl.startsWith('http') ? file.fileUrl : `http://localhost:5000${file.fileUrl}`}
+                                      alt={file.originalName}
+                                      className="max-w-xs max-h-64 rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
+                                      onClick={() => window.open(file.fileUrl.startsWith('http') ? file.fileUrl : `http://localhost:5000${file.fileUrl}`, '_blank')}
+                                    />
+                                  </div>
+                                )}
+                                
+                                {file.fileType === 'video' && (
+                                  <div className="mt-2">
+                                    <video
+                                      src={file.fileUrl.startsWith('http') ? file.fileUrl : `http://localhost:5000${file.fileUrl}`}
+                                      controls
+                                      className="max-w-xs max-h-64 rounded-lg"
+                                    />
+                                  </div>
+                                )}
+                                
+                                {file.fileType === 'audio' && (
+                                  <div className="mt-2">
+                                    <audio controls className="w-full max-w-xs">
+                                      <source src={file.fileUrl.startsWith('http') ? file.fileUrl : `http://localhost:5000${file.fileUrl}`} />
+                                      Your browser does not support the audio element.
+                                    </audio>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-between mt-2">
+                          <div className="flex items-center space-x-1">
+                            {message.reactions && message.reactions.length > 0 && (
+                              <div className="flex space-x-1">
+                                {message.reactions.reduce((acc, reaction) => {
+                                  const existing = acc.find(r => r.emoji === reaction.emoji)
+                                  if (existing) {
+                                    existing.count++
+                                    if (reaction.user === user?.id) existing.userReacted = true
+                                  } else {
+                                    acc.push({
+                                      emoji: reaction.emoji,
+                                      count: 1,
+                                      userReacted: reaction.user === user?.id
+                                    })
+                                  }
+                                  return acc
+                                }, []).map((reaction, idx) => (
+                                  <button
+                                    key={idx}
+                                    onClick={() => reactToMessage(message._id, reaction.emoji)}
+                                    className={`text-xs px-2 py-1 rounded-full transition-colors ${
+                                      reaction.userReacted
+                                        ? 'bg-primary-200 text-primary-800'
+                                        : message.sender._id === user?.id
+                                        ? 'bg-black bg-opacity-20 hover:bg-black hover:bg-opacity-30'
+                                        : 'bg-secondary-100 hover:bg-secondary-200'
+                                    }`}
+                                  >
+                                    {reaction.emoji} {reaction.count}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex items-center space-x-1">
+                            {message.sender._id === user?.id && (
+                              <span className="text-xs opacity-75">{formatTime(message.createdAt)}</span>
+                            )}
+                            
+                            <div className="flex space-x-1">
+                              {['👍', '❤️', '😊'].map(emoji => (
+                                <button
+                                  key={emoji}
+                                  onClick={() => reactToMessage(message._id, emoji)}
+                                  className={`text-xs p-1 rounded hover:${
+                                    message.sender._id === user?.id ? 'bg-black bg-opacity-20' : 'bg-secondary-100'
+                                  } transition-colors`}
+                                >
+                                  {emoji}
+                                </button>
+                              ))}
+                            </div>
+
+                            <button
+                              onClick={() => setReplyTo(message)}
+                              className={`p-1 rounded hover:${
+                                message.sender._id === user?.id ? 'bg-black bg-opacity-20' : 'bg-secondary-100'
+                              } transition-colors`}
+                            >
+                              <FiCornerUpLeft className="w-3 h-3" />
+                            </button>
+
+                            {message.sender._id === user?.id && (
+                              <button
+                                onClick={() => deleteMessage(message._id)}
+                                className="p-1 rounded hover:bg-red-500 hover:bg-opacity-20 transition-colors"
+                              >
+                                <FiTrash2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </motion.div>
+                ))
+              )}
+              
+              {/* Typing Indicators */}
+              {typingUsers.length > 0 && (
+                <div className="flex justify-start">
+                  <div className="bg-secondary-100 rounded-2xl px-4 py-2 text-sm text-secondary-600">
+                    {typingUsers.map(u => u.userName).join(', ')} {typingUsers.length === 1 ? 'is' : 'are'} typing...
+                  </div>
+                </div>
+              )}
+              
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Reply Preview */}
+            {replyTo && (
+              <div className="border-t border-secondary-200 p-3 bg-secondary-50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <FiCornerUpLeft className="w-4 h-4 text-secondary-600" />
+                    <span className="text-sm text-secondary-600">
+                      Replying to <strong>{replyTo.sender.name}</strong>: {replyTo.content.text?.slice(0, 50)}...
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setReplyTo(null)}
+                    className="p-1 hover:bg-secondary-200 rounded"
+                  >
+                    <FiX className="w-4 h-4 text-secondary-600" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* File Preview */}
+            {selectedFiles.length > 0 && (
+              <div className="border-t border-secondary-200 p-3 bg-secondary-50">
+                <div className="flex flex-wrap gap-2">
+                  {selectedFiles.map((file, index) => (
+                    <div key={index} className="flex items-center space-x-2 bg-white rounded-lg p-2 shadow-sm">
+                      {getFileIcon(file.type.split('/')[0])}
+                      <span className="text-sm truncate max-w-32">{file.name}</span>
+                      <span className="text-xs text-secondary-500">{formatFileSize(file.size)}</span>
+                      <button 
+                        onClick={() => removeFile(index)}
+                        className="p-1 hover:bg-red-100 rounded"
+                      >
+                        <FiX className="w-3 h-3 text-red-500" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Message Input */}
+            <div className="border-t border-secondary-200 p-4">
+              <div className="flex items-end space-x-3">
+                <div className="flex-1 relative">
+                  <textarea
+                    ref={textareaRef}
+                    value={newMessage}
+                    onChange={handleInputChange}
+                    placeholder="Type your message... (Shift+Enter for new line)"
+                    className="w-full px-4 py-3 pr-12 border border-secondary-200 rounded-xl resize-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all duration-300 min-h-[48px] max-h-[120px]"
+                    onKeyPress={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault()
+                        sendMessage()
+                      }
+                    }}
+                  />
+                  
+                  <div className="absolute right-3 bottom-3">
+                    <button
+                      onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+                      className="p-1 text-secondary-400 hover:text-primary-600 transition-colors"
+                    >
+                      <FiSmile className="w-5 h-5" />
+                    </button>
+                    
+                    {showEmojiPicker && (
+                    <div className="absolute bottom-full right-0 mb-2 bg-white border border-secondary-200 rounded-xl p-3 shadow-lg z-10 w-64">
+  <div className="grid grid-cols-5 gap-2">
+    {emojis.map((emoji, index) => (
+      <button
+        key={index}
+        onClick={() => addEmoji(emoji)}
+        className="w-10 h-10 flex items-center justify-center hover:bg-secondary-100 rounded-lg text-xl transition-colors"
+      >
+        {emoji}
+      </button>
+    ))}
+  </div>
+</div>
+                    )}
+                  </div>
+                </div>
+                
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="file"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    ref={fileInputRef}
+                    accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.txt"
+                  />
+                  
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-3 text-secondary-600 hover:text-primary-600 hover:bg-primary-50 rounded-xl transition-all duration-300"
+                    title="Attach files"
+                  >
+                    <FiPaperclip className="w-5 h-5" />
+                  </button>
+                  
+                  <button
+                    onClick={sendMessage}
+                    disabled={!newMessage.trim() && selectedFiles.length === 0}
+                    className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed px-4 py-3"
+                    title="Send message"
+                  >
+                    <FiSend className="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      </div>
+    </div>
+  )
+}
+
+export default Chat
